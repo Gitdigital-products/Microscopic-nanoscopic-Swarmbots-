@@ -1,0 +1,28 @@
+// Example objective wrapper
+async function swarmObjective(theta){
+  // map theta to params
+  const [wAlign,wCohere,wSep,neighborR,sepR,phaseStep,decoh] = theta;
+  const params = { w_align:wAlign, w_cohere:wCohere, w_separate:wSep, neighbor_r:neighborR, sep_r:sepR, phase_step:phaseStep, decoherence:decoh };
+  const frames = simulateSwarm(initAgents, { steps: 150, params, obstacles, bounds:{w:100,h:100} });
+  const last = frames[frames.length-1];
+
+  // collisions
+  let col = 0;
+  for (let i=0;i<last.length;i++){
+    for (let j=i+1;j<last.length;j++){
+      const dx=last[i].x-last[j].x, dy=last[i].y-last[j].y;
+      if (Math.hypot(dx,dy) < Math.max(0.5, sepR*0.5)) col++;
+    }
+  }
+  // edge
+  const W=100,H=100;
+  const edge = last.reduce((s,a)=>s + 1/Math.max(1e-3, Math.min(a.x, W-a.x, a.y, H-a.y)), 0);
+  // dispersion
+  const cx = last.reduce((s,a)=>s+a.x,0)/last.length;
+  const cy = last.reduce((s,a)=>s+a.y,0)/last.length;
+  const varr = last.reduce((s,a)=>s + (a.x-cx)**2 + (a.y-cy)**2, 0)/last.length;
+  const targetVar = 120;
+  const spread = ((varr - targetVar)**2)/(targetVar**2 + 1e-9);
+
+  return 2.0*col + 0.2*edge + 8.0*spread; // lower is better
+}
