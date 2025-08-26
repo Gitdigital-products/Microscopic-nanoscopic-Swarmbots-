@@ -1,0 +1,203 @@
+import math, random
+from typing import List, Tuple, Dict
+
+Vec = Tuple[float, float]
+
+def _add(a: Vec, b: Vec) -> Vec: return (a[0]+b[0], a[1]+b[1])
+def _sub(a: Vec, b: Vec) -> Vec: return (a[0]-b[0], a[1]-b[1])
+def _mul(a: Vec, s: float) -> Vec: return (a[0]*s, a[1]*s)
+def _len(a: Vec) -> float: return math.hypot(a[0], a[1])
+def _norm(a: Vec) -> Vec:
+    L = _len(a)
+    return (0.0, 0.0) if L == 0 else (a[0]/L, a[1]/L)
+
+def simulate_swarm(
+    agents: List[Dict],
+    steps: int,
+    dt: float = 0.05,
+    params: Dict = None,
+    obstacles: List[Dict] = None,
+    bounds: Tuple[float, float] = (100.0, 100.0),
+):
+    """
+    agents: [{x,y,vx,vy,phase}] phase in [0, 2π)
+    obstacles: [{cx, cy, r}]  circular barriers
+    returns: list of frames; each frame mirrors agents with updated x,y,vx,vy,phase
+    """
+    if params is None: params = {}
+    if obstacles is None: obstacles = []
+
+    # Boids weights
+    w_align = params.get("w_align", 0.7)
+    w_cohere = params.get("w_cohere", 0.6)
+    w_separate = params.get("w_separate", 1.2)
+    neighbor_r = params.get("neighbor_r", 8.0)
+    sep_r = params.get("sep_r", 3.0)
+
+    # Quantum-inspired
+    K = params.get("superposition_K", 5)
+    phase_step = params.get("phase_step", 0.35)
+    decoherence = params.get("decoherence", 0.02)  # added per-step gaussian std
+    tunneling_base = params.get("tunneling_base", 0.02)
+    lambda_len = params.get("lambda_len", 1.5)     # controls tunneling falloff
+
+    # Kinematics
+    max_speed = params.get("max_speed", 4.0)
+    max_force = params.get("max_force", 0.4)
+
+    W, H = bounds
+    frames = []
+
+    def in_circle(px, py, c):
+        return math.hypot(px - c["cx"], py - c["cy"]) <= c["r"]
+
+    def avoid_or_tunnel(p_from: Vec, p_to: Vec) -> Vec:
+        # If the straight line crosses a circle, either reflect or allow by tunneling.
+        # Simple check: if start outside and end inside, treat as a hit.
+        for c in obstacles:
+            if (not in_circle(p_from[0], p_from[1], c)) and in_circle(p_to[0], p_to[1], c):
+                # barrier thickness ~ radius (simple)
+                barrier = c["r"]
+                p_tun = tunneling_base * math.exp(-barrier / max(1e-6, lambda_len))
+                if random.random() < p_tun:
+                    return p_to  # tunneled
+                else:
+                    # reflect roughly by stepping back to the boundary and sliding
+                    dirv = _sub(p_to, p_from)
+                    n = _norm(_sub((p_to[0]-c["cx"], p_to[1]-c["cy"]), (0,0)))
+                    # reflect v: v' = v - 2(v·n) n
+                    dot = dirv[0]*n[0] + dirv[1]*n[1]
+                    reflected = (dirv[0] - 2*dot*n[0], dirv[1] - 2*dot*n[1])
+                    return _add(p_from, reflected)
+        return p_to
+
+    for _ in range(steps):
+        new_agents = []
+        for i, a in enumerate(agents):
+            pos = (a["x"], a["y"])
+            vel = (a["vx"], a["vy"])
+            phase = a.get("phase", 0.0)
+
+            # Neighborhood
+            neighbors = []
+            for j, b in enumerate(agents):
+                if i == j: continue
+                d = _sub((b["x"], b["y"]), pos)
+                if _len(d) <= neighbor_r:
+                    neighbors.append(b)
+
+            # Boids steering
+            align = (0.0, 0.0)
+            cohere = (0.0, 0.0)
+            separate = (0.0, 0.0)
+
+            if neighbors:
+                # Alignment
+                avg_v = (0.0, 0.0)
+                avg_p = (0.0, 0.0)
+                for n in neighbors:
+                    avg_v = _add(avg_v, (n["vx"], n["vy"]))
+                    avg_p = _add(avg_p, (n["x"], n["y"]))
+                avg_v = _mul(avg_v, 1.0/len(neighbors))
+                avg_p = _mul(avg_p, 1.0/len(neighbors))
+                align = _sub(_norm(avg_v), _norm(vel))
+
+                # Cohesion
+                to_center = _sub(avg_p, pos)
+                cohere = _norm(to_center)
+
+                # Separation
+                for n in neighbors:
+                    d = _sub(pos, (n["x"], n["y"]))
+                    dist = _len(d)
+                    if dist < sep_r and dist > 1e-6:
+                        separate = _add(separate, _mul(_norm(d), 1.0/(dist)))
+            
+            # Base acceleration
+            acc = (
+                w_align*align[0] + w_cohere*cohere[0] + w_separate*separate[0],
+                w_align*align[1] + w_cohere*cohere[1] + w_separate*separate[1],
+            )
+            # limit force
+            if _len(acc) > max_force:
+                acc = _mul(_norm(acc), max_force)
+
+            # Superposition: K candidate nudges around (acc) with phase offsets
+            candidates = []
+            weights = []
+            for k in range(K):
+                theta = phase + k*phase_step
+                rot = (math.cos(theta), math.sin(theta))
+                nudge = (_add(acc, _mul(rot, 0.2)))  # small phase-oriented probe
+                cand_v = _add(vel, _mul(nudge, dt))
+                # limit speed
+                sp = _len(cand_v)
+                if sp > max_speed:
+                    cand_v = _mul(_norm(cand_v), max_speed)
+                cand_p = (pos[0] + cand_v[0]*dt, pos[1] + cand_v[1]*dt)
+
+                # cost: prefer staying within bounds and away from obstacles
+                bx = min(cand_p[0], W - cand_p[0])
+                by = min(cand_p[1], H - cand_p[1])
+                bound_cost = 1.0 / max(1e-3, min(bx, by))  # higher near edge
+                obs_cost = 0.0
+                for c in obstacles:
+                    d = math.hypot(cand_p[0]-c["cx"], cand_p[1]-c["cy"])
+                    obs_cost += 1.0 / max(1e-3, d - c["r"])
+                speed_cost = max(0.0, sp - 0.8*max_speed)
+
+                cost = 0.4*bound_cost + 0.8*obs_cost + 0.2*speed_cost
+                candidates.append((cand_p, cand_v))
+                weights.append(math.exp(-cost))
+
+            # normalize and sample
+            Z = sum(weights) + 1e-12
+            r = random.random()
+            cum = 0.0
+            pick_idx = 0
+            for k, w in enumerate(weights):
+                cum += w / Z
+                if r <= cum:
+                    pick_idx = k
+                    break
+
+            cand_p, cand_v = candidates[pick_idx]
+
+            # decoherence jitter
+            jx = random.gauss(0, decoherence)
+            jy = random.gauss(0, decoherence)
+            cand_v = (cand_v[0] + jx, cand_v[1] + jy)
+            if _len(cand_v) > max_speed:
+                cand_v = _mul(_norm(cand_v), max_speed)
+
+            # obstacle interaction w/ tunneling
+            cand_p = avoid_or_tunnel(pos, cand_p)
+
+            # wrap/soft-wall bounds
+            x, y = cand_p
+            if x < 0: x, cand_v = 0, (abs(cand_v[0]), cand_v[1])
+            if x > W: x, cand_v = W, (-abs(cand_v[0]), cand_v[1])
+            if y < 0: y, cand_v = 0, (cand_v[0], abs(cand_v[1]))
+            if y > H: y, cand_v = H, (cand_v[0], -abs(cand_v[1]))
+
+            # advance phase a bit
+            phase = (phase + phase_step + random.uniform(-0.05, 0.05)) % (2*math.pi)
+
+            new_agents.append({"x": x, "y": y, "vx": cand_v[0], "vy": cand_v[1], "phase": phase})
+
+        agents = new_agents
+        frames.append(agents)
+    return frames
+
+
+# ---- minimal example ----
+if __name__ == "__main__":
+    N = 50
+    agents = [{"x": random.uniform(10, 90),
+               "y": random.uniform(10, 90),
+               "vx": random.uniform(-1, 1),
+               "vy": random.uniform(-1, 1),
+               "phase": random.uniform(0, 2*math.pi)} for _ in range(N)]
+    obstacles = [{"cx": 50.0, "cy": 50.0, "r": 7.0}]
+    frames = simulate_swarm(agents, steps=200, obstacles=obstacles)
+    # frames is a list[step] -> list[agents]; ready to visualize in your UI.
