@@ -1,0 +1,111 @@
+// Lightweight QIO core. Plug in your runSwarm(theta)->score (lower is better).
+
+export async function qioOptimize({
+  objective,          // async (theta)=>number
+  theta0,
+  bounds,             // [[lo,hi], ...]
+  steps = 120,
+  beams = 8,
+  eps = 0.06,
+  baseStep = 0.25,
+  beta = 0.8,
+  tunnelProb = 0.06,
+  rng = Math.random
+}) {
+  const dim = theta0.length;
+  const clip = t => t.map((v,i)=>Math.max(bounds[i][0], Math.min(bounds[i][1], v)));
+
+  const randUnit = () => {
+    const v = Array.from({length: dim}, ()=>gauss());
+    const L = Math.hypot(...v) || 1;
+    return v.map(x=>x/L);
+  };
+  const basis = Array.from({length: beams}, randUnit);
+  let amps = Array.from({length: beams}, ()=>[1/Math.sqrt(beams), 0]); // [re, im]
+
+  const mulPhase = (a, phi) => {
+    const [re, im] = a, c = Math.cos(-phi), s = Math.sin(-phi);
+    return [re*c - im*s, re*s + im*c];
+  };
+
+  const mix = (A) => {
+    const r = A.map(a=>a[0]);
+    const n = r.length;
+    let h = r.slice(), m = 1;
+    while (m < n) {
+      for (let i=0; i<n; i+=m*2) {
+        for (let j=i; j<i+m; j++) {
+          const u = h[j], v = h[j+m];
+          h[j]   = (u+v) / Math.SQRT2;
+          h[j+m] = (u-v) / Math.SQRT2;
+        }
+      }
+      m*=2;
+    }
+    return A.map((a,i)=>[h[i], a[1]]);
+  };
+
+  const measureIndex = (A) => {
+    const probs = A.map(([re,im])=>re*re+im*im);
+    const Z = probs.reduce((s,p)=>s+p, 0) || 1;
+    let r = rng(), c = 0;
+    for (let k=0;k<probs.length;k++){ c += probs[k]/Z; if (r<=c) return k; }
+    return probs.length-1;
+  };
+
+  const levyStep = (scale=1.0) => {
+    const u = rng() + 1e-9;
+    const mag = scale / (u ** (1/1.5));
+    const v = randUnit();
+    return v.map(x=>mag*x);
+  };
+
+  let theta = clip(theta0.slice());
+  let fTheta = await objective(theta);
+  let bestTheta = theta.slice(), bestScore = fTheta;
+  const history = [[0, fTheta]];
+
+  for (let t=1; t<=steps; t++){
+    amps = mix(amps);
+    const k = measureIndex(amps);
+    let dir = basis[k].slice();
+    // add other beams weighted by |amp|
+    for (let j=0;j<amps.length;j++){
+      if (j===k) continue;
+      const mag = Math.hypot(amps[j][0], amps[j][1]);
+      if (mag>1e-6){
+        dir = dir.map((d,i)=>d + mag*basis[j][i]);
+      }
+    }
+    const L = Math.hypot(...dir) || 1; dir = dir.map(d=>d/L);
+
+    const stepProbe = eps;
+    const thetap = clip(theta.map((v,i)=>v + stepProbe*dir[i]));
+    const thetam = clip(theta.map((v,i)=>v - stepProbe*dir[i]));
+    const [fp, fm] = await Promise.all([objective(thetap), objective(thetam)]);
+    const g = (fp - fm) / (2*stepProbe);
+    const phi = beta * Math.max(-1.5, Math.min(1.5, g));
+    amps = amps.map((a,j)=> j===k ? mulPhase(a, phi) : a);
+
+    const stepMag = baseStep * Math.pow(0.85, t/12.0);
+    const delta = (rng()<tunnelProb) ? levyStep(stepMag) : dir.map(d=>stepMag*d);
+    const cand = clip(theta.map((v,i)=>v - delta[i]));
+    const fCand = await objective(cand);
+
+    if (fCand <= fTheta || Math.random() < Math.exp(-(fCand - fTheta)/Math.max(1e-9, 0.25*Math.pow(0.92,t)))){
+      theta = cand; fTheta = fCand;
+    }
+    if (fTheta < bestScore){ bestScore = fTheta; bestTheta = theta.slice(); }
+    history.push([t, fTheta]);
+
+    // phase drift
+    amps = amps.map(([re,im])=>[re, im + (rng()*0.1 - 0.05)]);
+  }
+  return { bestTheta, bestScore, history };
+}
+
+// Box–Muller gaussian
+function gauss(){
+  let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
