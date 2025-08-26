@@ -1,0 +1,192 @@
+import math, random
+from typing import Callable, List, Tuple
+
+# ========== Core Quantum-Inspired Optimizer ==========
+
+def qio_optimize(
+    objective: Callable[[List[float]], float],
+    theta0: List[float],
+    bounds: List[Tuple[float, float]],
+    steps: int = 120,
+    beams: int = 8,
+    eps: float = 0.06,          # gradient probe radius
+    base_step: float = 0.25,    # initial step size (auto-anneals)
+    beta: float = 0.8,          # phase sensitivity to gradient
+    tunnel_prob: float = 0.06,  # chance of heavy-tailed "tunneling" jump
+    seed: int = 42
+):
+    """
+    objective(theta) -> scalar (lower is better)
+    theta0: initial parameter vector
+    bounds: [(lo, hi), ...] for each parameter
+    returns: (best_theta, best_score, history)
+    """
+    rng = random.Random(seed)
+    dim = len(theta0)
+
+    def clip_theta(t):
+        return [max(lo, min(hi, v)) for v, (lo, hi) in zip(t, bounds)]
+
+    # Orthonormal-ish random basis for beams
+    def rand_unit():
+        v = [rng.gauss(0,1) for _ in range(dim)]
+        L = math.sqrt(sum(x*x for x in v)) or 1.0
+        return [x/L for x in v]
+
+    basis = [rand_unit() for _ in range(beams)]
+
+    # Complex amplitudes (a_k = re+ i im); start uniform phases
+    amps = [(1.0/math.sqrt(beams), 0.0) for _ in range(beams)]
+
+    def amp_mul_phase(a, phi):  # multiply by e^{-i phi}
+        re, im = a
+        c, s = math.cos(-phi), math.sin(-phi)
+        return (re*c - im*s, re*s + im*c)
+
+    # Simple Hadamard-like real mixing (orthogonal)
+    def mix(amps):
+        reals = [a[0] for a in amps]
+        # 1D Walsh-Hadamard on real part; keep imag as-is (cheap & effective)
+        n = len(reals)
+        h = reals[:]
+        m = 1
+        while m < n:
+            for i in range(0, n, m*2):
+                for j in range(i, i+m):
+                    u = h[j]; v = h[j+m]
+                    h[j]   = (u + v) / math.sqrt(2)
+                    h[j+m] = (u - v) / math.sqrt(2)
+            m *= 2
+        return [(h[k], amps[k][1]) for k in range(n)]
+
+    def measure_index(amps):
+        probs = [a[0]*a[0] + a[1]*a[1] for a in amps]
+        Z = sum(probs) or 1.0
+        r = rng.random()
+        c = 0.0
+        for k, p in enumerate(probs):
+            c += p/Z
+            if r <= c: return k
+        return len(amps)-1
+
+    def levy_step(scale=1.0):
+        # Symmetric alpha-stable (alpha~1.5) approximated by power-law
+        u = rng.random() + 1e-9
+        mag = scale / (u ** (1/1.5))
+        vec = rand_unit()
+        return [mag * x for x in vec]
+
+    theta = clip_theta(theta0[:])
+    f_theta = objective(theta)
+    best = (theta[:], f_theta)
+    history = [(0, f_theta)]
+
+    for t in range(1, steps+1):
+        # Antithetic gradient estimate along pooled direction
+        # Combine beams (current preferred direction) into one probe dir
+        amps = mix(amps)
+        k = measure_index(amps)
+        dir_pref = basis[k][:]
+
+        # Add diversity from all beams (weighted by amplitude magnitude)
+        for j, a in enumerate(amps):
+            mag = math.sqrt(a[0]*a[0] + a[1]*a[1])
+            if j != k and mag > 1e-6:
+                dir_pref = [dp + mag*bj for dp, bj in zip(dir_pref, basis[j])]
+        # Normalize
+        L = math.sqrt(sum(x*x for x in dir_pref)) or 1.0
+        dir_pref = [x/L for x in dir_pref]
+
+        # Compute gradient estimate at theta using antithetic pair
+        step_probe = eps
+        thetap = clip_theta([v + step_probe*d for v, d in zip(theta, dir_pref)])
+        thetam = clip_theta([v - step_probe*d for v, d in zip(theta, dir_pref)])
+        fp = objective(thetap)
+        fm = objective(thetam)
+        g_scalar = (fp - fm) / (2.0*step_probe)   # directional derivative
+
+        # Phase kick proportional to gradient sign/magnitude
+        phi = beta * max(-1.5, min(1.5, g_scalar))  # clamp to keep stable
+        amps = [amp_mul_phase(a, phi) if j == k else a for j, a in enumerate(amps)]
+
+        # Decide move: standard or tunneling
+        step_mag = base_step * (0.85 ** (t/12.0))     # anneal
+        if rng.random() < tunnel_prob:
+            delta = levy_step(step_mag)
+        else:
+            delta = [step_mag * d for d in dir_pref]
+
+        cand = clip_theta([v - delta_i for v, delta_i in zip(theta, delta)])  # minus: downhill
+        f_cand = objective(cand)
+
+        # Metropolis-like accept w/ temperature
+        if f_cand <= f_theta:
+            theta, f_theta = cand, f_cand
+        else:
+            T = 0.25 * (0.92 ** t)
+            prob = math.exp(-(f_cand - f_theta) / max(1e-9, T))
+            if rng.random() < prob:
+                theta, f_theta = cand, f_cand
+
+        if f_theta < best[1]:
+            best = (theta[:], f_theta)
+
+        history.append((t, f_theta))
+
+        # Small random phase drift to avoid lock-in
+        amps = [(a[0], a[1] + rng.uniform(-0.05, 0.05)) for a in amps]
+
+    return best[0], best[1], history
+
+# ========== Example: plug into your swarm ==========
+
+# You provide: run_swarm(theta)->score (lower better).
+# Example scaffold (replace with your real simulator call):
+def example_swarm_objective_factory(simulate_fn, agents0, obstacles, bounds):
+    """
+    simulate_fn(agents0, steps, dt, params, obstacles, bounds)->frames
+    Score penalizes collisions + edge hugging + dispersion variance.
+    """
+    def objective(theta):
+        # Map theta to swarm params safely
+        w_align, w_cohere, w_sep, neighbor_r, sep_r, phase_step, decoh = theta
+        params = {
+            "w_align": w_align,
+            "w_cohere": w_cohere,
+            "w_separate": w_sep,
+            "neighbor_r": neighbor_r,
+            "sep_r": sep_r,
+            "phase_step": phase_step,
+            "decoherence": decoh,
+        }
+        frames = simulate_fn(agents0, steps=150, dt=0.05, params=params,
+                             obstacles=obstacles, bounds=bounds)
+        last = frames[-1]
+        # Metrics
+        # 1) pairwise collisions (distance < sep_r/2)
+        col = 0
+        for i in range(len(last)):
+            xi, yi = last[i]["x"], last[i]["y"]
+            for j in range(i+1, len(last)):
+                xj, yj = last[j]["x"], last[j]["y"]
+                if math.hypot(xi-xj, yi-yj) < max(0.5, sep_r*0.5):
+                    col += 1
+        # 2) edge penalty
+        W, H = bounds
+        edge = sum(1.0 / max(1e-3, min(a["x"], W-a["x"], a["y"], H-a["y"])) for a in last)
+        # 3) dispersion variance (prefer cohesive, not too tight)
+        cx = sum(a["x"] for a in last) / len(last)
+        cy = sum(a["y"] for a in last) / len(last)
+        var = sum((a["x"]-cx)**2 + (a["y"]-cy)**2 for a in last) / len(last)
+        target_var = 120.0  # tune for your scale
+        spread_pen = (var - target_var)**2 / (target_var**2 + 1e-9)
+
+        return 2.0*col + 0.2*edge + 8.0*spread_pen
+    return objective
+
+# --- Minimal usage (assuming you have simulate_swarm from earlier) ---
+# objective = example_swarm_objective_factory(simulate_swarm, agents_init, obstacles, (100.0, 100.0))
+# theta0   = [0.7, 0.6, 1.2, 8.0, 3.0, 0.35, 0.02]
+# bounds   = [(0.0,2.5),(0.0,2.5),(0.0,3.0),(3.0,20.0),(0.5,8.0),(0.05,1.2),(0.0,0.2)]
+# best_theta, best_score, history = qio_optimize(objective, theta0, bounds)
+# print(best_theta, best_score)
