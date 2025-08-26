@@ -1,0 +1,163 @@
+// Quantum-inspired swarm in 2D
+export function simulateSwarm(agents, {
+  steps,
+  dt = 0.05,
+  bounds = { w: 100, h: 100 },
+  params = {},
+  obstacles = [] // [{cx, cy, r}]
+} = {}) {
+  const W = bounds.w, H = bounds.h;
+
+  const w_align = params.w_align ?? 0.7;
+  const w_cohere = params.w_cohere ?? 0.6;
+  const w_separate = params.w_separate ?? 1.2;
+  const neighbor_r = params.neighbor_r ?? 8.0;
+  const sep_r = params.sep_r ?? 3.0;
+
+  const K = params.superposition_K ?? 5;
+  const phase_step = params.phase_step ?? 0.35;
+  const decoherence = params.decoherence ?? 0.02;
+  const tunneling_base = params.tunneling_base ?? 0.02;
+  const lambda_len = params.lambda_len ?? 1.5;
+
+  const max_speed = params.max_speed ?? 4.0;
+  const max_force = params.max_force ?? 0.4;
+
+  const len = (a) => Math.hypot(a[0], a[1]);
+  const add = (a,b) => [a[0]+b[0], a[1]+b[1]];
+  const sub = (a,b) => [a[0]-b[0], a[1]-b[1]];
+  const mul = (a,s) => [a[0]*s, a[1]*s];
+  const norm = (a) => {
+    const L = len(a);
+    return L === 0 ? [0,0] : [a[0]/L, a[1]/L];
+  };
+
+  const inCircle = (px, py, c) => Math.hypot(px-c.cx, py-c.cy) <= c.r;
+
+  function avoidOrTunnel(pFrom, pTo) {
+    for (const c of obstacles) {
+      if (!inCircle(pFrom[0], pFrom[1], c) && inCircle(pTo[0], pTo[1], c)) {
+        const barrier = c.r;
+        const pTun = tunneling_base * Math.exp(-barrier / Math.max(1e-6, lambda_len));
+        if (Math.random() < pTun) return pTo; // tunneled
+        // reflect
+        const dirv = sub(pTo, pFrom);
+        const n = norm([pTo[0]-c.cx, pTo[1]-c.cy]);
+        const dot = dirv[0]*n[0] + dirv[1]*n[1];
+        const reflected = [dirv[0]-2*dot*n[0], dirv[1]-2*dot*n[1]];
+        return add(pFrom, reflected);
+      }
+    }
+    return pTo;
+  }
+
+  const frames = [];
+  for (let s=0; s<steps; s++) {
+    const next = [];
+    for (let i=0; i<agents.length; i++) {
+      const a = agents[i];
+      let pos = [a.x, a.y];
+      let vel = [a.vx, a.vy];
+      let phase = a.phase ?? 0;
+
+      const neighbors = [];
+      for (let j=0; j<agents.length; j++) {
+        if (i === j) continue;
+        const b = agents[j];
+        if (Math.hypot(b.x - pos[0], b.y - pos[1]) <= neighbor_r) neighbors.push(b);
+      }
+
+      let align = [0,0], cohere = [0,0], separate = [0,0];
+      if (neighbors.length) {
+        let avgV = [0,0], avgP = [0,0];
+        for (const n of neighbors) {
+          avgV = add(avgV, [n.vx, n.vy]);
+          avgP = add(avgP, [n.x, n.y]);
+        }
+        avgV = mul(avgV, 1/neighbors.length);
+        avgP = mul(avgP, 1/neighbors.length);
+        align = sub(norm(avgV), norm(vel));
+        cohere = norm(sub(avgP, pos));
+
+        for (const n of neighbors) {
+          const d = sub(pos, [n.x, n.y]);
+          const dist = len(d);
+          if (dist < sep_r && dist > 1e-6) {
+            separate = add(separate, mul(norm(d), 1.0/dist));
+          }
+        }
+      }
+
+      let acc = [
+        w_align*align[0] + w_cohere*cohere[0] + w_separate*separate[0],
+        w_align*align[1] + w_cohere*cohere[1] + w_separate*separate[1],
+      ];
+      if (len(acc) > max_force) acc = mul(norm(acc), max_force);
+
+      const candidates = [];
+      const weights = [];
+      for (let k=0; k<K; k++) {
+        const theta = phase + k*phase_step;
+        const rot = [Math.cos(theta), Math.sin(theta)];
+        const nudge = add(acc, mul(rot, 0.2));
+        let candV = add(vel, mul(nudge, dt));
+        const sp = len(candV);
+        if (sp > max_speed) candV = mul(norm(candV), max_speed);
+        const candP = [pos[0] + candV[0]*dt, pos[1] + candV[1]*dt];
+
+        // cost
+        const bx = Math.min(candP[0], W - candP[0]);
+        const by = Math.min(candP[1], H - candP[1]);
+        const boundCost = 1.0 / Math.max(1e-3, Math.min(bx, by));
+        let obsCost = 0.0;
+        for (const c of obstacles) {
+          const d = Math.hypot(candP[0]-c.cx, candP[1]-c.cy);
+          obsCost += 1.0 / Math.max(1e-3, d - c.r);
+        }
+        const speedCost = Math.max(0, sp - 0.8*max_speed);
+        const cost = 0.4*boundCost + 0.8*obsCost + 0.2*speedCost;
+
+        candidates.push([candP, candV]);
+        weights.push(Math.exp(-cost));
+      }
+
+      const Z = weights.reduce((a,b)=>a+b, 1e-12);
+      let r = Math.random(), cum = 0, pick = 0;
+      for (let k=0; k<weights.length; k++) {
+        cum += weights[k]/Z;
+        if (r <= cum) { pick = k; break; }
+      }
+      let [candP, candV] = candidates[pick];
+
+      // decoherence
+      const jx = randomGaussian(0, decoherence);
+      const jy = randomGaussian(0, decoherence);
+      candV = [candV[0] + jx, candV[1] + jy];
+      if (len(candV) > max_speed) candV = mul(norm(candV), max_speed);
+
+      // obstacles & bounds
+      candP = avoidOrTunnel(pos, candP);
+      let [x,y] = candP;
+      if (x < 0) { x=0; candV = [Math.abs(candV[0]), candV[1]]; }
+      if (x > W) { x=W; candV = [-Math.abs(candV[0]), candV[1]]; }
+      if (y < 0) { y=0; candV = [candV[0], Math.abs(candV[1]]); }
+      if (y > H) { y=H; candV = [candV[0], -Math.abs(candV[1])]; }
+
+      phase = (phase + phase_step + (Math.random()*0.1 - 0.05)) % (2*Math.PI);
+
+      next.push({ x, y, vx: candV[0], vy: candV[1], phase });
+    }
+    agents = next;
+    frames.push(agents);
+  }
+  return frames;
+}
+
+// Box–Muller Gaussian
+function randomGaussian(mu=0, sigma=1){
+  let u=0, v=0;
+  while(u===0) u=Math.random();
+  while(v===0) v=Math.random();
+  const z = Math.sqrt(-2.0*Math.log(u)) * Math.cos(2*Math.PI*v);
+  return mu + sigma*z;
+}
