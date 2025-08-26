@@ -1,0 +1,211 @@
+package swarm
+
+import (
+	"math"
+	"math/rand"
+)
+
+type Agent struct {
+	X, Y  float64
+	VX, VY float64
+	Phase  float64
+}
+
+type Obstacle struct {
+	CX, CY float64
+	R      float64
+}
+
+type Params struct {
+	WAlign, WCohere, WSeparate float64
+	NeighborR, SepR            float64
+	SuperpositionK             int
+	PhaseStep, Decoherence     float64
+	TunnelingBase, LambdaLen   float64
+	MaxSpeed, MaxForce         float64
+}
+
+type Bounds struct{ W, H float64 }
+
+func defaultParams(p *Params) {
+	if p.WAlign == 0 { p.WAlign = 0.7 }
+	if p.WCohere == 0 { p.WCohere = 0.6 }
+	if p.WSeparate == 0 { p.WSeparate = 1.2 }
+	if p.NeighborR == 0 { p.NeighborR = 8.0 }
+	if p.SepR == 0 { p.SepR = 3.0 }
+	if p.SuperpositionK == 0 { p.SuperpositionK = 5 }
+	if p.PhaseStep == 0 { p.PhaseStep = 0.35 }
+	if p.Decoherence == 0 { p.Decoherence = 0.02 }
+	if p.TunnelingBase == 0 { p.TunnelingBase = 0.02 }
+	if p.LambdaLen == 0 { p.LambdaLen = 1.5 }
+	if p.MaxSpeed == 0 { p.MaxSpeed = 4.0 }
+	if p.MaxForce == 0 { p.MaxForce = 0.4 }
+}
+
+func length(a [2]float64) float64         { return math.Hypot(a[0], a[1]) }
+func add(a, b [2]float64) [2]float64      { return [2]float64{a[0]+b[0], a[1]+b[1]} }
+func sub(a, b [2]float64) [2]float64      { return [2]float64{a[0]-b[0], a[1]-b[1]} }
+func mul(a [2]float64, s float64) [2]float64 { return [2]float64{a[0]*s, a[1]*s} }
+func norm(a [2]float64) [2]float64 {
+	L := length(a)
+	if L == 0 { return [2]float64{0,0} }
+	return [2]float64{a[0]/L, a[1]/L}
+}
+func inCircle(px, py float64, c Obstacle) bool {
+	return math.Hypot(px-c.CX, py-c.CY) <= c.R
+}
+
+func avoidOrTunnel(pFrom, pTo [2]float64, obs []Obstacle, tunnelingBase, lambdaLen float64) [2]float64 {
+	for _, c := range obs {
+		if !inCircle(pFrom[0], pFrom[1], c) && inCircle(pTo[0], pTo[1], c) {
+			barrier := c.R
+			pTun := tunnelingBase * math.Exp(-barrier / math.Max(1e-6, lambdaLen))
+			if rand.Float64() < pTun {
+				return pTo
+			}
+			dirv := sub(pTo, pFrom)
+			n := norm([2]float64{pTo[0]-c.CX, pTo[1]-c.CY})
+			dot := dirv[0]*n[0] + dirv[1]*n[1]
+			reflected := [2]float64{dirv[0]-2*dot*n[0], dirv[1]-2*dot*n[1]}
+			return add(pFrom, reflected)
+		}
+	}
+	return pTo
+}
+
+func gaussian(mu, sigma float64) float64 {
+	// Box–Muller
+	u := 1 - rand.Float64()
+	v := 1 - rand.Float64()
+	z := math.Sqrt(-2.0*math.Log(u)) * math.Cos(2*math.Pi*v)
+	return mu + sigma*z
+}
+
+func SimulateSwarm(
+	agents []Agent,
+	steps int,
+	dt float64,
+	bounds Bounds,
+	p *Params,
+	obstacles []Obstacle,
+) [][]Agent {
+	if dt == 0 { dt = 0.05 }
+	defaultParams(p)
+	W, H := bounds.W, bounds.H
+	frames := make([][]Agent, 0, steps)
+
+	for s := 0; s < steps; s++ {
+		next := make([]Agent, len(agents))
+		for i, a := range agents {
+			pos := [2]float64{a.X, a.Y}
+			vel := [2]float64{a.VX, a.VY}
+			phase := a.Phase
+
+			neighbors := make([]Agent, 0)
+			for j, b := range agents {
+				if i == j { continue }
+				if math.Hypot(b.X-pos[0], b.Y-pos[1]) <= p.NeighborR {
+					neighbors = append(neighbors, b)
+				}
+			}
+
+			align := [2]float64{0,0}
+			cohere := [2]float64{0,0}
+			separate := [2]float64{0,0}
+			if len(neighbors) > 0 {
+				avgV := [2]float64{0,0}
+				avgP := [2]float64{0,0}
+				for _, n := range neighbors {
+					avgV = add(avgV, [2]float64{n.VX, n.VY})
+					avgP = add(avgP, [2]float64{n.X, n.Y})
+				}
+				avgV = mul(avgV, 1.0/float64(len(neighbors)))
+				avgP = mul(avgP, 1.0/float64(len(neighbors)))
+				align = sub(norm(avgV), norm(vel))
+				cohere = norm(sub(avgP, pos))
+				for _, n := range neighbors {
+					d := sub(pos, [2]float64{n.X, n.Y})
+					dist := length(d)
+					if dist < p.SepR && dist > 1e-6 {
+						separate = add(separate, mul(norm(d), 1.0/dist))
+					}
+				}
+			}
+
+			acc := [2]float64{
+				p.WAlign*align[0] + p.WCohere*cohere[0] + p.WSeparate*separate[0],
+				p.WAlign*align[1] + p.WCohere*cohere[1] + p.WSeparate*separate[1],
+			}
+			if length(acc) > p.MaxForce {
+				acc = mul(norm(acc), p.MaxForce)
+			}
+
+			type Cand struct{ P, V [2]float64; W float64 }
+			cands := make([]Cand, 0, p.SuperpositionK)
+			var Z float64 = 0
+
+			for k := 0; k < p.SuperpositionK; k++ {
+				theta := phase + float64(k)*p.PhaseStep
+				rot := [2]float64{math.Cos(theta), math.Sin(theta)}
+				nudge := add(acc, mul(rot, 0.2))
+				cV := add(vel, mul(nudge, dt))
+				sp := length(cV)
+				if sp > p.MaxSpeed {
+					cV = mul(norm(cV), p.MaxSpeed)
+				}
+				cP := [2]float64{pos[0] + cV[0]*dt, pos[1] + cV[1]*dt}
+
+				bx := math.Min(cP[0], W-cP[0])
+				by := math.Min(cP[1], H-cP[1])
+				boundCost := 1.0 / math.Max(1e-3, math.Min(bx, by))
+				var obsCost float64 = 0
+				for _, c := range obstacles {
+					d := math.Hypot(cP[0]-c.CX, cP[1]-c.CY)
+					obsCost += 1.0 / math.Max(1e-3, d - c.R)
+				}
+				speedCost := math.Max(0, sp - 0.8*p.MaxSpeed)
+				cost := 0.4*boundCost + 0.8*obsCost + 0.2*speedCost
+				w := math.Exp(-cost)
+				cands = append(cands, Cand{P: cP, V: cV, W: w})
+				Z += w
+			}
+			// sample
+			r := rand.Float64()
+			cum := 0.0
+			idx := 0
+			for k, c := range cands {
+				cum += c.W / (Z + 1e-12)
+				if r <= cum {
+					idx = k
+					break
+				}
+			}
+			cP := cands[idx].P
+			cV := cands[idx].V
+
+			// decoherence
+			cV[0] += gaussian(0, p.Decoherence)
+			cV[1] += gaussian(0, p.Decoherence)
+			if length(cV) > p.MaxSpeed {
+				cV = mul(norm(cV), p.MaxSpeed)
+			}
+
+			// obstacles and bounds
+			cP = avoidOrTunnel(pos, cP, obstacles, p.TunnelingBase, p.LambdaLen)
+			x, y := cP[0], cP[1]
+			if x < 0 { x=0; cV[0] = math.Abs(cV[0]) }
+			if x > W { x=W; cV[0] = -math.Abs(cV[0]) }
+			if y < 0 { y=0; cV[1] = math.Abs(cV[1]) }
+			if y > H { y=H; cV[1] = -math.Abs(cV[1]) }
+
+			phase = math.Mod(phase + p.PhaseStep + (rand.Float64()*0.1 - 0.05), 2*math.Pi)
+
+			next[i] = Agent{X: x, Y: y, VX: cV[0], VY: cV[1], Phase: phase}
+		}
+		agents = next
+		frame := make([]Agent, len(agents))
+		copy(frame, agents)
+		frames = append(frames, frame)
+	}
+	return frames
+}
