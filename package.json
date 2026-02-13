@@ -1,0 +1,23 @@
+{
+  "name": "microscopic-nanoscopic-swarmbots",
+  "version": "0.1.0",
+  "description": "JavaScript kernel for multi-scale swarm intelligence simulation.",
+  "type": "module",
+  "main": "sim/kernel.js",
+  "scripts": {
+    "test": "echo \"No JS tests yet\""
+  },
+  "keywords": [
+    "swarm",
+    "simulation",
+    "nanorobotics",
+    "multi-scale",
+    "research"
+  ],
+  "author": "Richard Duane Kindler",
+  "license": "MIT",
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "prettier": "^3.2.0"
+  }
+}
