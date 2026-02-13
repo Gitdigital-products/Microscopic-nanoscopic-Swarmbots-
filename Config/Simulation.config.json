@@ -1,0 +1,16 @@
+{
+  "name": "baseline-nano-swarm",
+  "micro_timestep": 1e-4,
+  "macro_step_ratio": 100,
+  "agent_count": 1000,
+  "physics": {
+    "diffusion_coefficient": 1e-12,
+    "viscosity": 0.001,
+    "temperature": 300
+  },
+  "governance": {
+    "max_local_density": 0.8,
+    "max_energy_output": 1.0,
+    "enable_fail_safe": true
+  }
+}
